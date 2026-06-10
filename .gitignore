@@ -1,5 +1,6 @@
 # 密钥和敏感文件
 .env
+settings.json
 
 # Python 缓存
 __pycache__/
@@ -8,10 +9,16 @@ __pycache__/
 # 工具生成的文件
 .codegraph/
 .qwen/
+.devcontainer/
 reasonix.toml
 
 # 用户数据
 history.json
+
+# PyInstaller 构建输出
+dist/
+build/
+*.spec
 
 # IDE
 .vscode/

@@ -11,7 +11,7 @@ import streamlit as st
 from docx import Document
 from PIL import Image
 
-from app.config import StopFlag
+from app.config import StopFlag, CONFIG, update_config
 from app.workflow import answer
 
 
@@ -315,6 +315,27 @@ def main():
             st.session_state.history = []
             save_history([])
             st.rerun()
+
+        # ===== 设置面板 =====
+        with st.expander("⚙ 设置"):
+            _display_names = {"gpt": "GPT", "gemini": "Gemini", "qwen": "Qwen", "claude": "Claude", "deepseek": "DeepSeek"}
+            for provider in ["gpt", "gemini", "qwen", "claude", "deepseek"]:
+                st.markdown(f"**{_display_names.get(provider, provider)}**")
+                new_key = st.text_input(
+                    "API Key", value=CONFIG[provider]["api_key"],
+                    type="password", key=f"set_key_{provider}")
+                new_url = st.text_input(
+                    "Base URL", value=CONFIG[provider]["base_url"],
+                    key=f"set_url_{provider}")
+                new_model = st.text_input(
+                    "Model", value=CONFIG[provider]["model"],
+                    key=f"set_model_{provider}")
+                if (new_key != CONFIG[provider]["api_key"] or
+                        new_url != CONFIG[provider]["base_url"] or
+                        new_model != CONFIG[provider]["model"]):
+                    update_config(provider, "api_key", new_key)
+                    update_config(provider, "base_url", new_url)
+                    update_config(provider, "model", new_model)
 
     # ===== 文件上传 =====
     uploaded_files = st.file_uploader(

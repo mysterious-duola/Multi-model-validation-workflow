@@ -1,10 +1,26 @@
-import os
+import os, json
 from dotenv import load_dotenv
 
 load_dotenv()
 
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json")
 
-def _get(key, default=""):
+_PROVIDERS = ["qwen", "deepseek", "gpt", "gemini", "claude"]
+_FIELDS = ["api_key", "base_url", "model"]
+_ENV_PREFIX = {
+    "qwen": "QWEN", "deepseek": "DEEPSEEK", "gpt": "GPT",
+    "gemini": "GEMINI", "claude": "CLAUDE",
+}
+_DEFAULTS = {
+    "qwen":     {"model": "qwen3.5-flash"},
+    "deepseek": {"model": "deepseek-v4-flash"},
+    "gpt":      {"model": "gpt-5.4"},
+    "gemini":   {"model": "gemini-2.5-flash"},
+    "claude":   {"model": "claude-haiku-4-5-20251001"},
+}
+
+
+def _env_get(key, default=""):
     val = os.getenv(key, "")
     if not val:
         try:
@@ -15,33 +31,59 @@ def _get(key, default=""):
     return val
 
 
-CONFIG = {
-    "qwen": {
-        "api_key": _get("QWEN_API_KEY"),
-        "base_url": _get("QWEN_BASE_URL"),
-        "model": _get("QWEN_MODEL", "qwen3.5-flash")
-    },
-    "deepseek": {
-        "api_key": _get("DEEPSEEK_API_KEY"),
-        "base_url": _get("DEEPSEEK_BASE_URL"),
-        "model": _get("DEEPSEEK_MODEL", "deepseek-v4-flash")
-    },
-    "gpt": {
-        "api_key": _get("GPT_API_KEY"),
-        "base_url": _get("GPT_BASE_URL"),
-        "model": _get("GPT_MODEL", "gpt-5.4")
-    },
-    "gemini": {
-        "api_key": _get("GEMINI_API_KEY"),
-        "base_url": _get("GEMINI_BASE_URL"),
-        "model": _get("GEMINI_MODEL", "gemini-2.5-flash")
-    },
-    "claude": {
-        "api_key": _get("CLAUDE_API_KEY"),
-        "base_url": _get("CLAUDE_BASE_URL"),
-        "model": _get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-    },
-}
+def _build_config():
+    cfg = {}
+    for provider in _PROVIDERS:
+        prefix = _ENV_PREFIX[provider]
+        cfg[provider] = {}
+        for field in _FIELDS:
+            env_key = f"{prefix}_{field.upper()}"
+            default = _DEFAULTS.get(provider, {}).get(field, "")
+            cfg[provider][field] = _env_get(env_key, default)
+    return cfg
+
+
+CONFIG = _build_config()
+
+
+def load_settings():
+    """从 settings.json 加载用户自定义配置，覆盖默认值"""
+    if not os.path.exists(SETTINGS_FILE):
+        return
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        for provider in _PROVIDERS:
+            if provider in saved:
+                for field in _FIELDS:
+                    if field in saved[provider] and saved[provider][field]:
+                        CONFIG[provider][field] = saved[provider][field]
+    except Exception:
+        pass
+
+
+def save_settings():
+    """将当前 CONFIG 保存到 settings.json"""
+    data = {}
+    for provider in _PROVIDERS:
+        data[provider] = {}
+        for field in _FIELDS:
+            data[provider][field] = CONFIG[provider].get(field, "")
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def update_config(provider, field, value):
+    """运行时修改配置并持久化"""
+    if provider in CONFIG and field in CONFIG[provider]:
+        CONFIG[provider][field] = value
+        save_settings()
+
+
+load_settings()
 
 
 # ===== 停止标志 =====
