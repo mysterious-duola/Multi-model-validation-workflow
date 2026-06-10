@@ -1,16 +1,46 @@
 # -*- coding: utf-8 -*-
 """PDF 导出模块 — 用 fpdf2 生成含中文、表格的 PDF 报告"""
-import os, re
+import os, re, urllib.request
 from datetime import datetime
 from fpdf import FPDF
+
+_FONT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "pdf_fonts")
+_FALLBACK_FONT_URL = "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+_FALLBACK_FONT_NAME = "NotoSansCJKsc-Regular.otf"
+
+
+def _find_cjk_font():
+    """在系统中查找可用的中文字体文件"""
+    candidates = [
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simsun.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    cache_path = os.path.join(_FONT_CACHE_DIR, _FALLBACK_FONT_NAME)
+    if os.path.exists(cache_path):
+        return cache_path
+
+    try:
+        os.makedirs(_FONT_CACHE_DIR, exist_ok=True)
+        urllib.request.urlretrieve(_FALLBACK_FONT_URL, cache_path)
+        return cache_path
+    except Exception:
+        return None
 
 
 def export_pdf(question, results):
     """生成 PDF 报告的字节流"""
     pdf = FPDF()
-    font_regular = "C:/Windows/Fonts/simhei.ttf"
-    if not os.path.exists(font_regular):
-        font_regular = None
+    font_regular = _find_cjk_font()
 
     if font_regular:
         pdf.add_font("CJK", "", font_regular)
