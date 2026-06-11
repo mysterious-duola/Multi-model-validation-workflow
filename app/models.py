@@ -6,7 +6,7 @@ import time
 import requests
 from PIL import Image, ImageOps
 
-from app.config import CONFIG
+from app.config import CONFIG, is_gemini_3
 
 
 def extract_sources(obj, limit=8):
@@ -198,6 +198,7 @@ def call_openai_style(name, prompt, system="你是严谨的科研助手，请用
         }
 
     if name == "deepseek":
+        # DeepSeek 默认开启思考（reasoning_effort=high，对齐 v1）
         data["reasoning_effort"] = "high"
 
     try:
@@ -261,9 +262,13 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
     if name == "gpt":
         if enable_search:
             data["tools"] = [{"type": "web_search"}]
+        # GPT 默认高强度思考（reasoning.effort=high，对齐 v1；不传 summary 避免慢）
+        data["reasoning"] = {"effort": "high"}
     if name == "qwen":
         if enable_search:
             data["tools"] = [{"type": "web_search"}]
+        # Qwen 默认开启思考（DashScope OpenAI-compatible 顶层参数）
+        data["enable_thinking"] = True
 
     payload_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
@@ -430,11 +435,13 @@ def call_claude(prompt, system="你是严谨的科研助手，请用中文回答
             },
         )
 
+    # Claude 默认开启中等强度思考（budget_tokens=4096，对齐用户要求）
     data = {
         "model": cfg["model"],
         "system": system,
-        "max_tokens": 4096,
+        "max_tokens": 12000,
         "messages": [{"role": "user", "content": content}],
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
     }
 
     payload_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
@@ -500,11 +507,17 @@ def call_gemini(prompt, system="你是严谨的科研助手，请用中文回答
             elif f["type"] == "text_file":
                 parts.append({"text": f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---"})
 
+    # Gemini 默认开启思考：2.x 系列 thinkingBudget=-1，3.x 系列 thinkingBudget=8192（中等）
+    if is_gemini_3(cfg.get("model", "")):
+        _gem_budget = 8192
+    else:
+        _gem_budget = -1
+
     data = {
         "contents": [{"role": "user", "parts": parts}],
         "systemInstruction": {"parts": [{"text": system}]},
         "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": -1}
+            "thinkingConfig": {"thinkingBudget": _gem_budget}
         }
     }
     if enable_search:

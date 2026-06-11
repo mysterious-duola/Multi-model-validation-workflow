@@ -562,7 +562,6 @@ def main():
         if st.session_state.current_q:
             st.subheader(f"问题：{st.session_state.current_q}")
 
-        # 提取各阶段结果
         results = st.session_state.results
         initial_keys = [k for k in results if "初始回答" in k]
         revised_keys = [k for k in results if "修订后" in k]

@@ -20,6 +20,14 @@ _DEFAULTS = {
 }
 
 
+def is_gemini_3(model_name):
+    """识别模型是否为 Gemini 3.x 系列（支持独立多档思考强度）"""
+    if not isinstance(model_name, str):
+        return False
+    name = model_name.lower()
+    return "gemini-3" in name or "gemini3" in name or "gemini 3" in name
+
+
 def _env_get(key, default=""):
     val = os.getenv(key, "")
     if not val:

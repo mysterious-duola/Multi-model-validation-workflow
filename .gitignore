@@ -5,6 +5,7 @@ settings.json
 # Python 缓存
 __pycache__/
 *.pyc
+venv/
 
 # 工具生成的文件
 .codegraph/

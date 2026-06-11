@@ -2,6 +2,21 @@
 
 多 AI 模型并发回答 + 交叉验证 + 最终综合审查的科研问答工具。
 
+## 版本记录
+
+### v2 · 2026-06-11
+
+- **启动脚本优化**：`启动科研工作流.bat` 自动激活 venv
+- **思考默认开启**：各模型硬编码默认思考参数（GPT `reasoning.effort=high`、Claude `budget_tokens=4096`、Gemini 2.x `-1` / 3.x `8192`、DeepSeek `reasoning_effort=high`、Qwen `enable_thinking=true`）
+
+### v1
+
+- 多模型并发独立回答
+- 交叉验证：每个模型看到其他模型答案后自我修订
+- DeepSeek 最终综合审查（可选）
+- PDF / Word / 图片附件支持
+- 历史记录侧边栏
+
 ## 安装与启动
 
 ```bash
