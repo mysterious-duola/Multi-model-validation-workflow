@@ -1,3 +1,14 @@
+"""
+Streamlit 主界面 — 应用入口（streamlit run ui.py）
+
+职责：
+- UI 布局与交互（问题输入、模型选择、附件上传、结果展示）
+- session_state 生命周期管理（历史记录、运行状态、日志队列）
+- 文件上传解析（图片 / PDF / Word → 统一文件信息结构）
+- 后台线程调度：worker 线程通过 queue 与 UI 通信，不注入 Streamlit ctx
+
+后端逻辑（config / models / workflow）完全解耦，可独立测试和复用。
+"""
 import base64
 import io
 import json
@@ -35,7 +46,11 @@ def save_history(history):
 
 
 def process_uploaded_files(uploaded_files):
-    """将 Streamlit UploadedFile 列表转为统一的文件信息列表"""
+    """将 Streamlit UploadedFile 列表转为统一的文件信息列表。
+    输出格式：
+    - 图片: {"type": "image", "name": ..., "mime_type": ..., "base64": ...}
+    - 文档: {"type": "text_file", "name": ..., "text": ...}
+    自动检测文件类型，PDF/Word 提取纯文本，超长内容截断头尾。"""
     result = []
     if not uploaded_files:
         return result
@@ -107,6 +122,8 @@ def process_uploaded_files(uploaded_files):
                 st.toast(f"⚠️ .doc 格式兼容性有限，建议转为 .docx 或 PDF 后上传")
     return result
 
+# export_pdf 仅在 UI 层使用（导出按钮），与后端 workflow 无关，
+# 因此放在 ui.py 内而非 app/__init__.py 的统一导出中
 from app.pdf_export import export_pdf as _export_pdf
 
 
@@ -177,6 +194,8 @@ def main():
     )
     st.title("🔬 多模型科研工作流")
 
+    # Streamlit 默认布局不支持精确的按钮宽度和对齐控制，
+    # 通过注入自定义 CSS 实现工具栏行：固定宽度的模型选择器 + 等宽的开关按钮 + 弹性空白
     # ===== session_state 初始化 =====
     for key, default in [
         ("history", None), ("running", False), ("stop_flag", None),
@@ -490,6 +509,9 @@ def main():
         # worker 里完全不碰任何 st.* API。
         _models = st.session_state.selected_models
         def worker():
+            """后台工作线程：只通过 queue 与 UI 通信。
+            绝不调用 st.* API — Streamlit 的 ScriptRunContext 是线程局部的，
+            跨线程调用会导致 RuntimeError 或数据竞争。"""
             try:
                 result = answer(
                     question.strip(),
@@ -514,6 +536,9 @@ def main():
     if st.session_state.running:
         @st.fragment(run_every=2)
         def progress_panel():
+            """用 @st.fragment 实现轻量级轮询：
+            每 2 秒局部刷新此区域，而非 rerun 整个页面，
+            避免重复执行上方所有 UI 构建逻辑。"""
             log_q = st.session_state.log_queue
             result_q = st.session_state.result_queue
 
@@ -542,6 +567,8 @@ def main():
         progress_panel()
 
     # ===== 回填历史 =====
+    # 发送时先创建占位条目（results=None），结果就绪后回填。
+    # 这样即使页面崩溃，历史列表中仍保留问题记录。
     if (not st.session_state.running
             and st.session_state.results is not None
             and st.session_state.pending_question):

@@ -1,3 +1,12 @@
+"""
+工作流编排模块 — 三阶段流水线
+1. 并发独立回答：选定模型同时回答同一问题
+2. 交叉验证：每个模型看到其他模型的答案后自我修订
+3. DeepSeek 最终综合（可选）：汇总所有答案给出终审结论
+
+整个模块不依赖任何 st.* API，通过 queue 与 UI 层通信，
+确保可以在后台线程中安全运行。
+"""
 import concurrent.futures
 import queue
 import threading
@@ -38,6 +47,8 @@ def _thought_tag(meta):
 
 # ===== 交叉检查（完全不碰 st.*）=====
 def cross_check(question, answers: dict, stop_flag=None, log_queue=None, force_search=False):
+    """交叉验证：每个模型只看到其他模型的答案，进行盲审式修订。
+    不给模型看自己的答案，避免自我强化偏差。"""
     revised = {}
 
     def check_one(name):
@@ -146,7 +157,7 @@ def answer(question, stop_flag=None, log_queue=None, force_search=False, final_c
     if stop_flag and stop_flag.is_set():
         return {f"{k.upper()} 初始回答": v for k, v in first_round.items()} | {"状态": "已中止"}
 
-    # ===== 第二阶段：多模型则交叉检查 =====
+    # ===== 第二阶段：多模型则交叉检查，单模型无对照意义直接跳过 =====
     if len(models) >= 2:
         revised = cross_check(question, first_round, stop_flag=stop_flag, log_queue=log_queue, force_search=force_search)
         if stop_flag and stop_flag.is_set():

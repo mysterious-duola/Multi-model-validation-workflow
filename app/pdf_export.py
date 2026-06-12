@@ -10,7 +10,10 @@ _FALLBACK_FONT_NAME = "NotoSansSC.ttf"
 
 
 def _find_cjk_font():
-    """在系统中查找可用的中文字体文件"""
+    """在系统中查找可用的中文字体文件。
+    fpdf2 默认字体不支持 CJK 字符，必须加载 TrueType 中文字体。
+    按优先级遍历 Windows / Linux 常见路径，全部未命中时从 Google Fonts
+    下载 NotoSansSC 到本地缓存（~/.cache/pdf_fonts/），避免打包体积膨胀。"""
     candidates = [
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/msyh.ttc",
@@ -72,6 +75,8 @@ def export_pdf(question, results):
         ("DeepSeek 最终综合", "DeepSeek 最终综合"),
     ]
 
+    # TrueType 中文字体不包含 emoji 字形，渲染时会产生空白方块，
+    # 因此在写入 PDF 前用正则去除所有 emoji 字符
     _emoji = re.compile(
         "["
         "\U0001F300-\U0001F9FF"  # 大部分 emoji 块（含杂项符号、表情、交通、旗帜等）
@@ -151,6 +156,9 @@ def export_pdf(question, results):
         pdf.ln(2)
 
     def _render_text_block(content):
+        """手动将 Markdown 文本渲染为 PDF 元素。
+        fpdf2 不原生支持 Markdown，因此逐行解析：
+        标题（#）、表格（|...|）、列表项（- / 1.）、超链接、水平线等。"""
         lines = content.split("\n")
         i = 0
         in_list = False

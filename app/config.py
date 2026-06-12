@@ -1,8 +1,15 @@
+"""
+配置管理模块
+- 从 .env 加载各模型 API 密钥 / Base URL / Model 名称
+- 支持 settings.json 持久化运行时修改（侧边栏设置面板）
+- 提供 StopFlag 线程安全中止标志供 UI ↔ worker 通信
+"""
 import os, json
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# settings.json 放在项目根目录（app/ 的上一级），方便 UI 层和启动脚本直接访问
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json")
 
 _PROVIDERS = ["qwen", "deepseek", "gpt", "gemini", "claude"]
@@ -11,6 +18,7 @@ _ENV_PREFIX = {
     "qwen": "QWEN", "deepseek": "DEEPSEEK", "gpt": "GPT",
     "gemini": "GEMINI", "claude": "CLAUDE",
 }
+# 各模型的硬编码默认值，当 .env 和 settings.json 均未配置时生效
 _DEFAULTS = {
     "qwen":     {"model": "qwen3.5-flash"},
     "deepseek": {"model": "deepseek-v4-flash"},
@@ -33,6 +41,7 @@ def _env_get(key, default=""):
     if not val:
         try:
             import streamlit as st
+            # Streamlit Cloud 部署时，密钥存放在 secrets.toml 而非 .env，此处兼容
             val = st.secrets.get(key, default)
         except Exception:
             val = default
@@ -96,6 +105,9 @@ load_settings()
 
 # ===== 停止标志 =====
 class StopFlag:
+    """线程安全中止标志。
+    不用 threading.Event 是因为 worker 只在检查点轮询 is_set()，
+    不需要阻塞等待，简单布尔值足够且更易序列化到 session_state。"""
     def __init__(self):
         self._stop = False
 

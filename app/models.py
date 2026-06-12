@@ -1,3 +1,9 @@
+"""
+模型调用模块 — 统一封装各 AI 提供商的 API 差异
+- call() 是唯一对外入口，根据 model name 路由到对应协议函数
+- 支持文本 / 图片 / 文档附件，自动压缩图片以控制 token 开销
+- 各函数返回 (text, meta_dict) 二元组，meta 中 has_thought 标记是否触发了思考链
+"""
 import base64
 import io
 import json
@@ -10,7 +16,9 @@ from app.config import CONFIG, is_gemini_3
 
 
 def extract_sources(obj, limit=8):
-    """Collect source URLs from provider-specific citation/grounding metadata."""
+    """从提供商各异的响应 JSON 中递归收集引用来源 URL。
+    不同提供商把 citation 放在完全不同的字段名下（url、uri、url_citation、web 等），
+    因此只能递归遍历整个响应对象，按启发式规则提取。"""
     found = []
     seen = set()
 
@@ -77,7 +85,9 @@ def attachment_overview(files):
 
 
 def compress_image_for_responses(file_info, max_side=1280, max_bytes=1_200_000):
-    """Compress uploaded image data before sending it through Responses API gateways."""
+    """压缩图片以控制 API 请求体积。
+    多模型 API（尤其中转站）对 payload 大小敏感，超大会超时或被拒绝。
+    策略：先缩放到 max_side，再逐步降低 JPEG quality 直到满足 max_bytes。"""
     raw = base64.b64decode(file_info["base64"])
     img = Image.open(io.BytesIO(raw))
     img = ImageOps.exif_transpose(img)
@@ -101,6 +111,9 @@ def compress_image_for_responses(file_info, max_side=1280, max_bytes=1_200_000):
 
 
 def gpt_image_budget(prompt, system, files):
+    """根据文本上下文长度动态调整图片压缩参数。
+    GPT Responses API 对总 payload 有隐性限制，文本越长就需要图片越小，
+    因此按文本字节数分档返回不同的 max_side 和 max_bytes。"""
     text_bytes = len((system + "\n" + prompt).encode("utf-8"))
     if files:
         for f in files:
@@ -115,6 +128,9 @@ def gpt_image_budget(prompt, system, files):
 
 
 def build_gemini_url(cfg):
+    """构建 Gemini API 完整端点 URL。
+    用户配置的 base_url 可能是裸域名（如 googleapis.com）或已拼好的端点，
+    此函数统一归一化为 :generateContent 端点。"""
     base = cfg.get("base_url", "https://generativelanguage.googleapis.com").rstrip("/")
     if base.endswith(":generateContent"):
         return base
@@ -130,6 +146,9 @@ def build_claude_url(cfg):
 
 # ===== 格式A1：OpenAI Chat Completions（DeepSeek / Qwen）=====
 def call_openai_style(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, files=None, enable_search=False):
+    """OpenAI Chat Completions 协议调用。
+    服务于 DeepSeek 和 Qwen：DeepSeek 不支持 image_url，图片附件降级为文字描述；
+    Qwen 支持多模态，图片以 image_url base64 内联发送。"""
     if stop_flag and stop_flag.is_set():
         return f"[{name}] 已中止", {"has_thought": False}
     cfg = CONFIG[name]
@@ -274,7 +293,9 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
 
     last_conn_error = None
     resp = None
-    for conn_attempt in range(2):  # 代理不稳定，失败等 3 秒重试一次
+    # 中转代理偶尔不稳定导致 ConnectionError/Timeout，仅对此类瞬态错误重试一次；
+    # HTTP 错误（4xx/5xx）说明 API 本身有问题，不应重试
+    for conn_attempt in range(2):
         try:
             resp = requests.post(cfg["base_url"], headers=headers, json=data, timeout=120)
             resp.encoding = "utf-8"
@@ -296,6 +317,12 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
         body = resp.json()
         sources = extract_sources(body)
 
+        # Responses API 的文本位置在不同版本间差异极大：
+        # 1) output[].content[].text（标准）
+        # 2) output_text（某些精简版本）
+        # 3) output[].content[].parts[].text（嵌套版本）
+        # 4) 递归全量扫描（终极兜底，防止任何变体遗漏）
+        # 因此逐级尝试，确保任何格式变体都能提取到文本
         text_parts = []
         reasoning_summary = []
         for item in body.get("output", []):
@@ -558,6 +585,12 @@ def call_gemini(prompt, system="你是严谨的科研助手，请用中文回答
 
 # ===== 统一调用入口 =====
 def call(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, enable_search=False, files=None):
+    """统一调用入口：根据模型名称路由到对应协议函数。
+    - gemini → Google Generative AI 协议
+    - claude → Anthropic Messages 协议
+    - gpt/qwen → OpenAI Responses API 协议
+    - 其他（deepseek 等）→ OpenAI Chat Completions 协议
+    """
     if name == "gemini":
         return call_gemini(prompt, system, stop_flag, files=files, enable_search=enable_search)
     elif name == "claude":
