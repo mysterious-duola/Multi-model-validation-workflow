@@ -15,6 +15,54 @@ from PIL import Image, ImageOps
 from app.config import CONFIG, is_gemini_3
 
 
+# ===== 共享模板与 helper =====
+
+TEXT_FILE_TEMPLATE = "\n\n--- 以下为附件「{name}」的完整内容 ---\n{text}\n--- 附件结束 ---"
+IMAGE_LABEL_TEMPLATE = "下面这张图片是附件「{name}」："
+
+
+def _check_stop(name, stop_flag):
+    """返回中止元组（如已请求停止），否则返回 None。"""
+    if stop_flag and stop_flag.is_set():
+        return f"[{name}] 已中止", {"has_thought": False}
+    return None
+
+
+def _image_budget_per_image(image_count):
+    """单张图片的字节预算，Qwen / Claude / GPT 1280 档共用。"""
+    return max(500_000, 1_200_000 // max(image_count, 1))
+
+
+def _count_images(files):
+    return sum(1 for f in (files or []) if f["type"] == "image")
+
+
+def _prepare_prompt_with_overview(prompt, files):
+    """拼接 prompt 与附件概览，返回 (prompt_text, overview_string)。"""
+    overview = attachment_overview(files)
+    prompt_text = f"{prompt}\n\n{overview}" if overview else prompt
+    return prompt_text, overview
+
+
+def _bearer_headers(api_key, extra=None):
+    """构建 Authorization: Bearer 请求头，可选合并额外字段。"""
+    h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _post_api(url, headers, data, timeout=60):
+    """通用 POST → 编码 → 状态检查 → JSON 解析链。
+    成功返回解析后的 JSON body，失败抛出异常（由调用方 try/except 包装）。"""
+    resp = requests.post(url, headers=headers, json=data, timeout=timeout)
+    resp.encoding = "utf-8"
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ===== 引用来源提取 =====
+
 def extract_sources(obj, limit=8):
     """从提供商各异的响应 JSON 中递归收集引用来源 URL。
     不同提供商把 citation 放在完全不同的字段名下（url、uri、url_citation、web 等），
@@ -84,6 +132,8 @@ def attachment_overview(files):
     return "\n".join(lines)
 
 
+# ===== 图片压缩 =====
+
 def compress_image_for_responses(file_info, max_side=1280, max_bytes=1_200_000):
     """压缩图片以控制 API 请求体积。
     多模型 API（尤其中转站）对 payload 大小敏感，超大会超时或被拒绝。
@@ -119,13 +169,15 @@ def gpt_image_budget(prompt, system, files):
         for f in files:
             if f["type"] == "text_file":
                 text_bytes += len(f.get("text", "").encode("utf-8"))
-    image_count = sum(1 for f in files or [] if f["type"] == "image")
+    image_count = _count_images(files)
     if text_bytes > 40_000:
         return 768, max(220_000, 650_000 // max(image_count, 1))
     if text_bytes > 16_000:
         return 960, max(350_000, 900_000 // max(image_count, 1))
-    return 1280, max(500_000, 1_200_000 // max(image_count, 1))
+    return 1280, _image_budget_per_image(image_count)
 
+
+# ===== URL 构建 =====
 
 def build_gemini_url(cfg):
     """构建 Gemini API 完整端点 URL。
@@ -145,68 +197,54 @@ def build_claude_url(cfg):
 
 
 # ===== 格式A1：OpenAI Chat Completions（DeepSeek / Qwen）=====
+
 def call_openai_style(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, files=None, enable_search=False):
     """OpenAI Chat Completions 协议调用。
     服务于 DeepSeek 和 Qwen：DeepSeek 不支持 image_url，图片附件降级为文字描述；
     Qwen 支持多模态，图片以 image_url base64 内联发送。"""
-    if stop_flag and stop_flag.is_set():
-        return f"[{name}] 已中止", {"has_thought": False}
-    cfg = CONFIG[name]
-    url = cfg["base_url"]
-    headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "Content-Type": "application/json"
-    }
+    stopped = _check_stop(name, stop_flag)
+    if stopped:
+        return stopped
 
-    # 构建 messages content
+    cfg = CONFIG[name]
+    headers = _bearer_headers(cfg["api_key"])
+
     if files:
-        overview = attachment_overview(files)
-        user_content = []
-        # DeepSeek 不支持 image_url，图片转文本提示
+        prompt_text, overview = _prepare_prompt_with_overview(prompt, files)
+
         if name == "deepseek":
             prompt_parts = [prompt]
             if overview:
                 prompt_parts.append(f"\n\n{overview}")
             for f in files:
                 if f["type"] == "text_file":
-                    prompt_parts.append(f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---")
+                    prompt_parts.append(TEXT_FILE_TEMPLATE.format(name=f["name"], text=f["text"]))
                 elif f["type"] == "image":
-                    prompt_parts.append(f"\n\n[图片附件: {f['name']}，DeepSeek 无法直接查看图片，请根据文字描述回答。]")
-            data = {
-                "model": cfg["model"],
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": "".join(prompt_parts)}
-                ]
-            }
+                    prompt_parts.append(
+                        f"\n\n[图片附件: {f['name']}，DeepSeek 无法直接查看图片，请根据文字描述回答。]"
+                    )
+            user_content = "".join(prompt_parts)
         else:
-            prompt_text = prompt
-            if overview:
-                prompt_text = f"{prompt}\n\n{overview}"
-            user_content.append({"type": "text", "text": prompt_text})
-            image_count = sum(1 for f in files if f["type"] == "image")
-            image_max_bytes = max(500_000, 1_200_000 // max(image_count, 1))
+            user_content = [{"type": "text", "text": prompt_text}]
+            img_budget = _image_budget_per_image(_count_images(files))
             for f in files:
                 if f["type"] == "image":
-                    image_payload = compress_image_for_responses(
-                        f,
-                        max_side=1280,
-                        max_bytes=image_max_bytes,
-                    )
-                    user_content.append({"type": "text", "text": f"下面这张图片是附件「{f['name']}」："})
+                    image_payload = compress_image_for_responses(f, max_side=1280, max_bytes=img_budget)
+                    user_content.append({"type": "text", "text": IMAGE_LABEL_TEMPLATE.format(name=f["name"])})
                     user_content.append({
                         "type": "image_url",
                         "image_url": {"url": f"data:{image_payload['mime_type']};base64,{image_payload['base64']}"}
                     })
                 elif f["type"] == "text_file":
-                    user_content.append({"type": "text", "text": f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---"})
-            data = {
-                "model": cfg["model"],
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content}
-                ]
-            }
+                    user_content.append({"type": "text", "text": TEXT_FILE_TEMPLATE.format(name=f["name"], text=f["text"])})
+
+        data = {
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content}
+            ]
+        }
     else:
         data = {
             "model": cfg["model"],
@@ -217,14 +255,10 @@ def call_openai_style(name, prompt, system="你是严谨的科研助手，请用
         }
 
     if name == "deepseek":
-        # DeepSeek 默认开启思考（reasoning_effort=high，对齐 v1）
         data["reasoning_effort"] = "high"
 
     try:
-        resp = requests.post(url, headers=headers, json=data, timeout=60)
-        resp.encoding = "utf-8"
-        resp.raise_for_status()
-        body = resp.json()
+        body = _post_api(cfg["base_url"], headers, data, timeout=60)
         sources = extract_sources(body)
         msg = body["choices"][0]["message"]
         has_thought = bool(msg.get("reasoning_content"))
@@ -237,36 +271,30 @@ def call_openai_style(name, prompt, system="你是严谨的科研助手，请用
         return f"[{name} 调用失败]: {str(e)}", {"has_thought": False}
 
 
-# ===== 格式A2：OpenAI Responses API（GPT）=====
-def call_responses_style(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, enable_search=False, files=None):
-    if stop_flag and stop_flag.is_set():
-        return f"[{name}] 已中止", {"has_thought": False}
-    cfg = CONFIG[name]
-    headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "Content-Type": "application/json"
-    }
+# ===== 格式A2：OpenAI Responses API（GPT / Qwen）=====
 
-    # 构建 input content：文本 + 图片 / 附件
+def call_responses_style(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, enable_search=False, files=None):
+    stopped = _check_stop(name, stop_flag)
+    if stopped:
+        return stopped
+
+    cfg = CONFIG[name]
+    headers = _bearer_headers(cfg["api_key"])
+
     if files:
-        overview = attachment_overview(files)
-        prompt_text = f"{prompt}\n\n{overview}" if overview else prompt
+        prompt_text, _ = _prepare_prompt_with_overview(prompt, files)
         user_content = [{"type": "input_text", "text": prompt_text}]
         gpt_max_side, gpt_max_bytes = gpt_image_budget(prompt, system, files)
         for f in files:
             if f["type"] == "image":
-                image_payload = compress_image_for_responses(
-                    f,
-                    max_side=gpt_max_side,
-                    max_bytes=gpt_max_bytes,
-                )
-                user_content.append({"type": "input_text", "text": f"下面这张图片是附件「{f['name']}」："})
+                image_payload = compress_image_for_responses(f, max_side=gpt_max_side, max_bytes=gpt_max_bytes)
+                user_content.append({"type": "input_text", "text": IMAGE_LABEL_TEMPLATE.format(name=f["name"])})
                 user_content.append({
                     "type": "input_image",
                     "image_url": f"data:{image_payload['mime_type']};base64,{image_payload['base64']}"
                 })
             elif f["type"] == "text_file":
-                user_content.append({"type": "input_text", "text": f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---"})
+                user_content.append({"type": "input_text", "text": TEXT_FILE_TEMPLATE.format(name=f["name"], text=f["text"])})
         system_input = [{"role": "system", "content": [{"type": "input_text", "text": system}]}]
         user_input = [{"role": "user", "content": user_content}]
         data = {"model": cfg["model"], "input": system_input + user_input}
@@ -281,20 +309,16 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
     if name == "gpt":
         if enable_search:
             data["tools"] = [{"type": "web_search"}]
-        # GPT 默认高强度思考（reasoning.effort=high，对齐 v1；不传 summary 避免慢）
         data["reasoning"] = {"effort": "high"}
     if name == "qwen":
         if enable_search:
             data["tools"] = [{"type": "web_search"}]
-        # Qwen 默认开启思考（DashScope OpenAI-compatible 顶层参数）
         data["enable_thinking"] = True
 
     payload_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
     last_conn_error = None
     resp = None
-    # 中转代理偶尔不稳定导致 ConnectionError/Timeout，仅对此类瞬态错误重试一次；
-    # HTTP 错误（4xx/5xx）说明 API 本身有问题，不应重试
     for conn_attempt in range(2):
         try:
             resp = requests.post(cfg["base_url"], headers=headers, json=data, timeout=120)
@@ -317,12 +341,6 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
         body = resp.json()
         sources = extract_sources(body)
 
-        # Responses API 的文本位置在不同版本间差异极大：
-        # 1) output[].content[].text（标准）
-        # 2) output_text（某些精简版本）
-        # 3) output[].content[].parts[].text（嵌套版本）
-        # 4) 递归全量扫描（终极兜底，防止任何变体遗漏）
-        # 因此逐级尝试，确保任何格式变体都能提取到文本
         text_parts = []
         reasoning_summary = []
         for item in body.get("output", []):
@@ -331,7 +349,6 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
                 for c in item.get("content", []):
                     t = c.get("text") or c.get("output_text")
                     if not t and isinstance(c, dict):
-                        # 有些响应把文字放在 content.parts 里
                         for part in c.get("parts") or []:
                             t = part.get("text") or part.get("output_text")
                             if t:
@@ -343,15 +360,12 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
                     if s.get("text"):
                         reasoning_summary.append(s["text"])
 
-        # 补充扫描：检查顶层 output_text（某些 API 版本放在这里）
         if not text_parts and body.get("output_text"):
             text_parts.append(body["output_text"])
 
-        # 兜底扫描：遍历 output 数组里所有可能藏文字的地方
         if not text_parts:
             for item in body.get("output", []):
                 if isinstance(item, dict):
-                    # 递归取所有可能的文本字段
                     for key in ("text", "output_text", "content"):
                         val = item.get(key)
                         if isinstance(val, str) and val.strip():
@@ -363,7 +377,6 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
                                     if t and isinstance(t, str) and t.strip():
                                         text_parts.append(t)
 
-        # 终极兜底：递归扫描整个响应 JSON，捡捞任何长字符串
         if not text_parts and not reasoning_summary:
             def _deep_extract(obj):
                 texts = []
@@ -377,14 +390,12 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
                         texts.extend(_deep_extract(v))
                 return texts
             candidates = _deep_extract(body)
-            # 取最长的几条（排除推理相关的）
             reasoning_tokens_val = body.get("usage", {}).get("output_tokens_details", {}).get("reasoning_tokens", 0)
             if reasoning_tokens_val > 0:
                 text_parts = [c for c in candidates if "reasoning" not in c.lower()][:3] if candidates else []
             else:
                 text_parts = candidates[:3] if candidates else []
 
-        # 检测是否真的发生了思考
         has_thought = len(reasoning_summary) > 0
         if not has_thought:
             reasoning_tokens = body.get("usage", {}).get("output_tokens_details", {}).get("reasoning_tokens", 0)
@@ -412,33 +423,26 @@ def call_responses_style(name, prompt, system="你是严谨的科研助手，请
 
 
 # ===== 格式C：Anthropic Messages API（Claude）=====
-def call_claude(prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, files=None, enable_search=False):
-    if stop_flag and stop_flag.is_set():
-        return "[claude] 已中止", {"has_thought": False}
-    cfg = CONFIG["claude"]
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "anthropic-version": "2023-06-01",
-    }
 
-    overview = attachment_overview(files)
-    prompt_text = f"{prompt}\n\n{overview}" if overview else prompt
+def call_claude(prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, files=None, enable_search=False):
+    stopped = _check_stop("claude", stop_flag)
+    if stopped:
+        return stopped
+
+    cfg = CONFIG["claude"]
+    headers = _bearer_headers(cfg["api_key"], extra={"anthropic-version": "2023-06-01"})
+
+    prompt_text, _ = _prepare_prompt_with_overview(prompt, files)
     content = [{"type": "text", "text": prompt_text}]
     if files:
-        image_count = sum(1 for f in files if f["type"] == "image")
-        image_max_bytes = max(500_000, 1_200_000 // max(image_count, 1))
+        img_budget = _image_budget_per_image(_count_images(files))
         for f in files:
             if f["type"] == "image":
-                image_payload = compress_image_for_responses(
-                    f,
-                    max_side=1280,
-                    max_bytes=image_max_bytes,
-                )
+                image_payload = compress_image_for_responses(f, max_side=1280, max_bytes=img_budget)
                 media_type = image_payload["mime_type"]
                 if media_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
                     media_type = "image/jpeg"
-                content.append({"type": "text", "text": f"下面这张图片是附件「{f['name']}」："})
+                content.append({"type": "text", "text": IMAGE_LABEL_TEMPLATE.format(name=f["name"])})
                 content.append({
                     "type": "image",
                     "source": {
@@ -448,10 +452,7 @@ def call_claude(prompt, system="你是严谨的科研助手，请用中文回答
                     },
                 })
             elif f["type"] == "text_file":
-                content.append({
-                    "type": "text",
-                    "text": f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---",
-                })
+                content.append({"type": "text", "text": TEXT_FILE_TEMPLATE.format(name=f["name"], text=f["text"])})
 
     if enable_search:
         content.insert(
@@ -462,7 +463,6 @@ def call_claude(prompt, system="你是严谨的科研助手，请用中文回答
             },
         )
 
-    # Claude 默认开启中等强度思考（budget_tokens=4096，对齐用户要求）
     data = {
         "model": cfg["model"],
         "system": system,
@@ -473,18 +473,7 @@ def call_claude(prompt, system="你是严谨的科研助手，请用中文回答
 
     payload_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
     try:
-        resp = requests.post(build_claude_url(cfg), headers=headers, json=data, timeout=120)
-        resp.encoding = "utf-8"
-        resp.raise_for_status()
-        try:
-            body = resp.json()
-        except ValueError:
-            return (
-                f"[claude 调用失败]: 响应不是 JSON\n"
-                f"status_code={resp.status_code}\n"
-                f"payload_bytes={payload_bytes}\n"
-                f"{resp.text[:500]}"
-            ), {"has_thought": False}
+        body = _post_api(build_claude_url(cfg), headers, data, timeout=120)
         sources = extract_sources(body)
         text_parts = []
         for part in body.get("content", []):
@@ -505,26 +494,23 @@ def call_claude(prompt, system="你是严谨的科研助手，请用中文回答
 
 
 # ===== 格式B：Google AI Studio（Gemini）=====
+
 def call_gemini(prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, files=None, enable_search=False):
-    if stop_flag and stop_flag.is_set():
-        return "[gemini] 已中止", {"has_thought": False}
+    stopped = _check_stop("gemini", stop_flag)
+    if stopped:
+        return stopped
+
     cfg = CONFIG["gemini"]
     url = build_gemini_url(cfg)
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": cfg["api_key"]
-    }
+    headers = {"Content-Type": "application/json", "x-goog-api-key": cfg["api_key"]}
 
-    # 构建 parts：文本 + 图片/附件
-    overview = attachment_overview(files)
-    prompt_text = f"{prompt}\n\n{overview}" if overview else prompt
+    prompt_text, _ = _prepare_prompt_with_overview(prompt, files)
     parts = [{"text": prompt_text}]
     if files:
         for f in files:
             if f["type"] == "image":
-                # 压缩后发给中转站
                 compressed = compress_image_for_responses(f, max_side=1024, max_bytes=800_000)
-                parts.append({"text": f"下面这张图片是附件「{f['name']}」："})
+                parts.append({"text": IMAGE_LABEL_TEMPLATE.format(name=f["name"])})
                 parts.append({
                     "inline_data": {
                         "mime_type": compressed["mime_type"],
@@ -532,9 +518,8 @@ def call_gemini(prompt, system="你是严谨的科研助手，请用中文回答
                     }
                 })
             elif f["type"] == "text_file":
-                parts.append({"text": f"\n\n--- 以下为附件「{f['name']}」的完整内容 ---\n{f['text']}\n--- 附件结束 ---"})
+                parts.append({"text": TEXT_FILE_TEMPLATE.format(name=f["name"], text=f["text"])})
 
-    # Gemini 默认开启思考：2.x 系列 thinkingBudget=-1，3.x 系列 thinkingBudget=8192（中等）
     if is_gemini_3(cfg.get("model", "")):
         _gem_budget = 8192
     else:
@@ -551,39 +536,35 @@ def call_gemini(prompt, system="你是严谨的科研助手，请用中文回答
         data["tools"] = [{"google_search": {}}]
 
     last_error = ""
-    last_body = ""
-    for attempt in range(2):  # 最多重试 1 次
+    for attempt in range(2):
         try:
-            resp = requests.post(url, headers=headers, json=data, timeout=60)
-            resp.encoding = "utf-8"
-            if not resp.ok:
-                last_body = resp.text[:500]
-            resp.raise_for_status()
-            body = resp.json()
+            body = _post_api(url, headers, data, timeout=60)
             sources = extract_sources(body)
             candidate = body["candidates"][0]
             content_parts = candidate["content"]["parts"]
-            # 思考检测：3.5 / 2.5 均支持
-            # 方式1: parts 中的 thought 标记
             has_thought = any(p.get("thought") for p in content_parts)
-            # 方式2: 3.5 的 thoughtSignature 元数据
             if not has_thought:
                 ts = candidate.get("content", {}).get("thoughtSignature")
                 has_thought = bool(ts)
             text = next(p["text"] for p in reversed(content_parts) if "text" in p)
             return append_sources(text, sources), {"has_thought": has_thought}
-        except Exception as e:
+        except requests.HTTPError as e:
             last_error = str(e)
+            if e.response is not None:
+                last_error += f" 响应: {e.response.text[:500]}"
             if attempt == 0 and "503" in last_error:
                 time.sleep(2)
                 continue
             break
+        except Exception as e:
+            last_error = str(e)
+            break
 
-    detail = f" 响应: {last_body}" if last_body else ""
-    return f"[gemini 调用失败]: {last_error}{detail}", {"has_thought": False}
+    return f"[gemini 调用失败]: {last_error}", {"has_thought": False}
 
 
 # ===== 统一调用入口 =====
+
 def call(name, prompt, system="你是严谨的科研助手，请用中文回答。", stop_flag=None, enable_search=False, files=None):
     """统一调用入口：根据模型名称路由到对应协议函数。
     - gemini → Google Generative AI 协议
@@ -595,9 +576,7 @@ def call(name, prompt, system="你是严谨的科研助手，请用中文回答�
         return call_gemini(prompt, system, stop_flag, files=files, enable_search=enable_search)
     elif name == "claude":
         return call_claude(prompt, system, stop_flag, files=files, enable_search=enable_search)
-    elif name == "gpt":
-        return call_responses_style(name, prompt, system, stop_flag, enable_search=enable_search, files=files)
-    elif name == "qwen":
+    elif name in ("gpt", "qwen"):
         return call_responses_style(name, prompt, system, stop_flag, enable_search=enable_search, files=files)
     else:
         return call_openai_style(name, prompt, system, stop_flag, files=files)
