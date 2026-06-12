@@ -226,13 +226,26 @@ def main():
             overflow: hidden !important;
             text-overflow: ellipsis !important;
             width: 100% !important;
+            max-width: 100% !important;
+            box-sizing: border-box !important;
         }
-        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child button > div,
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child button > div {
+            display: block !important;
+            text-align: left !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            box-sizing: border-box !important;
+        }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child button > div > span {
             display: inline !important;
             text-align: left !important;
-            width: auto !important;
             margin: 0 !important;
+            padding: 0 !important;
         }
         /* 右侧删除列：固定宽度、右对齐 */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:last-child {
@@ -298,10 +311,11 @@ def main():
                     for real_idx, item in reversed(items):
                         col_btn, col_del = st.columns([10, 1])
                         with col_btn:
-                            label = f"[{item['time']}] {item['question']}"
+                            full_label = f"[{item['time']}] {item['question']}"
+                            label = full_label if len(full_label) <= 40 else full_label[:37] + "..."
                             if st.button(label, key=f"h_{real_idx}", use_container_width=True,
                                         disabled=item.get("results") is None,
-                                        help=label):
+                                        help=full_label):
                                 st.session_state.results = item["results"]
                                 st.session_state.current_q = item["question"]
                         with col_del:
